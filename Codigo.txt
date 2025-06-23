@@ -1,0 +1,716 @@
+/*
+ * HeatBed Controller
+ * 
+ * Este código controla um sistema de aquecimento de cama quente com 16 segmentos,
+ * usando sensores de temperatura e controle PID. Inclui funcionalidades de segurança térmica,
+ * modo de debug e comandos Serial para controle e configuração.
+ * 
+ * Autor: Edgar Mata
+ * Empresa: My Machines
+ * Site: https://my-machines.net
+ * Licença: Creative Commons Attribution 4.0 International
+ */
+
+#include <Arduino.h> // Include Arduino header for pin definitions
+#include <math.h>    // Library for logarithmic calculations
+#include <avr/pgmspace.h> // Required for PROGMEM usage
+
+// ====== Pin Definitions ======
+// Relay pins for the 16-segment heating module
+const int relayPins[16] = {
+    22, 24, 26, 28,  // Segments 1-4
+    30, 32, 34, 36,  // Segments 5-8
+    38, 40, 42, 44,  // Segments 9-12
+    53, 51, 49, 47   // Segments 13-16
+};
+
+// Temperature sensor pins (A0-A15)
+const int tempSensors[16] = {
+    A0, A1, A2, A3,     // Sensors 1-4
+    A4, A5, A6, A7,     // Sensors 5-8
+    A8, A9, A10, A11,   // Sensors 9-12
+    A12, A13, A14, A15  // Sensors 13-16
+};
+
+// PWM output pins for the DueX5 (D5, D6, D7, D8)
+const int pwmOutPins[4] = {5, 6, 7, 8};
+
+// PWM input pins from the DueX5 (temperature setpoints from Duet)
+const int pwmInPins[4] = {9, 10, 11, 12};
+
+// ====== Temperature Control Variables ======
+// Target temperatures for each section
+float targetTemp[4] = {0, 0, 0, 0};
+
+// Array to track active segments (true = active, false = inactive)
+bool activeSegments[16] = {false}; // Initially, all segments are inactive
+
+// ====== Thermistor Configuration ======
+// Pull-up resistor value (adjust based on your circuit)
+#define PULLUP_RESISTOR 10000.0 // 10kΩ
+
+// Steinhart-Hart coefficients for a 100k NTC thermistor
+#define A 0.001129148
+#define B 0.000234125
+#define C 0.0000000876741
+
+// Temperature lookup table (ADC to temperature mapping)
+const int tempTable[][2] PROGMEM = {
+    {1, 300},    // ADC very low (~0°C)
+    {200, 250},  // ADC = 200 corresponds to ~250°C
+    {300, 200},  // Example: ADC 300 → 200°C
+    {400, 150},
+    {500, 120},
+    {600, 90},
+    {700, 60},
+    {800, 30},
+    {900, 10},
+    {1023, 0}
+};
+
+// ====== Constants and Macros ======
+#define NUM_SEGMENTS 16          // Total number of segments
+#define NUM_SECTIONS 4           // Total number of sections
+#define TEMP_HYSTERESIS 2.0      // Temperature hysteresis (in °C)
+#define PWM_TIMEOUT 25000        // Timeout for PWM signal reading (in microseconds)
+#define DEBUG_INTERVAL 5000      // Interval for debug messages (in ms)
+#define SAFETY_TEMP_MAX 120.0    // Maximum safe temperature (in °C)
+#define PID_OUTPUT_THRESHOLD 0.5 // Threshold for PID output to activate relays
+
+// ====== PWM Configuration Variables ======
+int pwmMinValue = 0;    // Minimum PWM signal value
+int pwmMaxValue = 2000; // Maximum PWM signal value
+float tempMin = 0.0;    // Minimum temperature corresponding to PWM
+float tempMax = 100.0;  // Maximum temperature corresponding to PWM
+
+// ====== Temperature Cache ======
+// Cache for storing temperature readings
+float cachedTemperatures[16] = {0};
+
+// Timestamps for the last temperature readings
+unsigned long lastReadTime[16] = {0};
+
+// Minimum interval between temperature readings (in ms)
+const unsigned long readInterval = 1000;
+
+// ====== PID Control Variables ======
+// PID gains
+float pidKp = 2.0; // Proportional gain
+float pidKi = 0.5; // Integral gain
+float pidKd = 1.0; // Derivative gain
+
+// PID state variables
+float pidIntegral[16] = {0}; // Integral term for each segment
+float pidLastError[16] = {0}; // Last error for derivative calculation
+unsigned long pidLastUpdate[16] = {0}; // Last PID update timestamp
+
+// ====== Debug Mode ======
+// Flag to enable/disable debug mode
+bool debugMode = false;
+
+// ====== Thermal Safety ======
+// Flag to indicate if thermal safety has been triggered
+bool thermalSafetyTriggered = false;
+
+// ====== Function Prototypes ======
+float readTemperature(int sensorPin);
+void configurePWMRange(int minPWM, int maxPWM, float minTemp, float maxTemp);
+void setupPins();
+void printHelp();
+void printSystemStatus();
+void processSerialCommands();
+void updateAllSections();
+void printActiveSegmentsPeriodically();
+void checkThermalSafety();
+void resetThermalSafety();
+float calculatePID(int segmentIndex, float currentTemp, float targetTemp);
+void controlHeatingWithPID(int secIndex, int start, int end);
+void debugMonitor();
+void activateSegment(int segment);
+void deactivateSegment(int segment);
+void activateAllSegments();
+void deactivateAllSegments();
+void printActiveSegments();
+void processExternalCommand(String command);
+
+// ====== Setup Function ======
+// Initializes the system, configures pins, and prints a startup message
+void setup() {
+    Serial.begin(115200); // Initialize Serial communication
+    Serial1.begin(115200);  // Comunicação com Duet
+    setupPins();          // Configure all pins
+    Serial.println("Arduino Mega ready to receive commands from Duet.");
+    Serial.println("Temperature control system initialized!");
+}
+
+// ====== Main Loop ======
+// Handles commands, updates sections, and manages heating control
+void loop() {
+    if (!thermalSafetyTriggered) {
+        processSerialCommands();          // Process incoming Serial commands
+        updateAllSections();              // Update temperature and PWM for all sections
+        printActiveSegmentsPeriodically(); // Print active segments periodically
+
+        // Perform PID-based heating control for each section
+        for (int i = 0; i < NUM_SECTIONS; i++) {
+            controlHeatingWithPID(i, i * (NUM_SEGMENTS / NUM_SECTIONS), (i * (NUM_SEGMENTS / NUM_SECTIONS)) + (NUM_SEGMENTS / NUM_SECTIONS) - 1);
+        }
+
+        checkThermalSafety(); // Check for thermal safety violations
+
+        // If debug mode is enabled, print detailed system status
+        if (debugMode) {
+            debugMonitor();
+        }
+    } else {
+        Serial.println("System in thermal safety state. Use RESET_SAFETY command to reset.");
+        delay(DEBUG_INTERVAL); // Prevent message spamming
+    }
+    delay(DEBUG_INTERVAL); // General delay to avoid overloading the system
+
+    if (Serial1.available()) {
+        String recebido = Serial1.readStringUntil('\n');
+        recebido.trim();  // Remove extra characters
+        Serial.print("Recebido da Duet: ");
+        Serial.println(recebido);
+        processExternalCommand(recebido); // Process the received command
+    }
+}
+
+// Função para processar comandos recebidos da Duet (Serial1)
+void processExternalCommand(String command) {
+    command.trim();
+
+    if (command == "ON ALL") {
+        if (!thermalSafetyTriggered) {
+            activateAllSegments();
+            Serial.println("All segments activated (Duet).");
+        } else {
+            Serial.println("Error: Thermal safety active (Duet).");
+        }
+    } else if (command == "OFF ALL") {
+        deactivateAllSegments();
+        Serial.println("All segments deactivated (Duet).");
+    } else if (command.startsWith("ON")) {
+        int segmentNumber = command.substring(3).toInt();
+        if (segmentNumber >= 1 && segmentNumber <= 16) {
+            if (!thermalSafetyTriggered) {
+                activateSegment(segmentNumber);
+                Serial.print("Segment ");
+                Serial.print(segmentNumber);
+                Serial.println(" activated (Duet).");
+            } else {
+                Serial.println("Error: Thermal safety active (Duet).");
+            }
+        } else {
+            Serial.println("Error: Invalid segment number (Duet).");
+        }
+    } else if (command.startsWith("OFF")) {
+        int segmentNumber = command.substring(4).toInt();
+        if (segmentNumber >= 1 && segmentNumber <= 16) {
+            deactivateSegment(segmentNumber);
+            Serial.print("Segment ");
+            Serial.print(segmentNumber);
+            Serial.println(" deactivated (Duet).");
+        } else {
+            Serial.println("Error: Invalid segment number (Duet).");
+        }
+    } else if (command == "RESET_SAFETY") {
+        resetThermalSafety();
+        Serial.println("Thermal safety state reset (Duet).");
+    } else if (command == "DEBUG ON") {
+        debugMode = true;
+        Serial.println("Debug mode enabled (Duet).");
+    } else if (command == "DEBUG OFF") {
+        debugMode = false;
+        Serial.println("Debug mode disabled (Duet).");
+    } else if (command == "HELP") {
+        printHelp();
+    } else if (command == "STATUS") {
+        printSystemStatus();
+    } else {
+        Serial.print("Error: Unrecognized command (Duet): ");
+        Serial.println(command);
+    }
+}
+
+// ====== Function to configure PWM range ======
+void configurePWMRange(int minPWM, int maxPWM, float minTemp, float maxTemp) {
+    pwmMinValue = minPWM;
+    pwmMaxValue = maxPWM;
+    tempMin = minTemp;
+    tempMax = maxTemp;
+
+    Serial.println("PWM range configured:");
+    Serial.print("  PWM Min: ");
+    Serial.println(pwmMinValue);
+    Serial.print("  PWM Max: ");
+    Serial.println(pwmMaxValue);
+    Serial.print("  Temp Min: ");
+    Serial.println(tempMin);
+    Serial.print("  Temp Max: ");
+    Serial.println(tempMax);
+}
+
+// ====== Function to set up pins ======
+void setupPins() {
+    // Configure temperature sensor pins as input
+    for (int i = 0; i < 16; i++) {
+        pinMode(tempSensors[i], INPUT);
+    }
+
+    // Configure PWM output pins as output
+    for (int i = 0; i < 4; i++) {
+        pinMode(pwmOutPins[i], OUTPUT);
+    }
+
+    // Configure PWM input pins as input
+    for (int i = 0; i < 4; i++) {
+        pinMode(pwmInPins[i], INPUT);
+    }
+
+    // Configure relay pins as output
+    for (int i = 0; i < 16; i++) {
+        pinMode(relayPins[i], OUTPUT);
+        digitalWrite(relayPins[i], HIGH); // Keep relays off (active LOW)
+    }
+}
+
+// ====== Function to print available commands ======
+void printHelp() {
+    Serial.println("Available commands:");
+    Serial.println("  ON ALL              - Activate all segments");
+    Serial.println("  OFF ALL             - Deactivate all segments");
+    Serial.println("  ON <n>              - Activate segment <n> (1-16)");
+    Serial.println("  OFF <n>             - Deactivate segment <n> (1-16)");
+    Serial.println("  SET_PWM_RANGE <minPWM> <maxPWM> <minTemp> <maxTemp> - Configure PWM range");
+    Serial.println("  DEBUG ON            - Enable debug mode");
+    Serial.println("  DEBUG OFF           - Disable debug mode");
+    Serial.println("  STATUS              - Display system status");
+    Serial.println("  HELP                - Display this list of commands");
+    Serial.println("  RESET_SAFETY        - Reset thermal safety state");
+}
+
+// ====== Function to print system status ======
+void printSystemStatus() {
+    Serial.println("=== System Status ===");
+    Serial.println("Debug Mode: " + String(debugMode ? "Enabled" : "Disabled"));
+    Serial.println("Thermal Safety State: " + String(thermalSafetyTriggered ? "Triggered" : "Normal"));
+    for (int i = 0; i < 16; i++) {
+        Serial.print("Segment ");
+        Serial.print(i + 1);
+        Serial.print(": ");
+        Serial.print(activeSegments[i] ? "Active" : "Inactive");
+        Serial.print(" | Temp: ");
+        Serial.print(readTemperature(tempSensors[i]));
+        Serial.println("°C");
+    }
+    for (int i = 0; i < 4; i++) {
+        Serial.print("Sec ");
+        Serial.print(i + 1);
+        Serial.print(" | Setpoint: ");
+        Serial.print(targetTemp[i]);
+        Serial.println("°C");
+    }
+    Serial.println("=====================");
+}
+
+// ====== Function to process Serial commands ======
+void processSerialCommands() {
+    if (Serial.available()) {
+        String command = Serial.readStringUntil('\n');
+        command.trim();
+
+        Serial.print("Received command: \"");
+        Serial.print(command);
+        Serial.println("\"");
+
+        if (command == "DEBUG ON") {
+            debugMode = true;
+            Serial.println("Debug mode enabled.");
+        } else if (command == "DEBUG OFF") {
+            debugMode = false;
+            Serial.println("Debug mode disabled.");
+        } else if (command == "STATUS") {
+            printSystemStatus();
+        } else if (command.startsWith("SET_PWM_RANGE")) {
+            // Example command: SET_PWM_RANGE 0 2000 0 100
+            int minPWM = command.substring(14, command.indexOf(" ", 14)).toInt();
+            int maxPWM = command.substring(command.indexOf(" ", 14) + 1, command.lastIndexOf(" ")).toInt();
+            float minTemp = command.substring(command.lastIndexOf(" ") + 1, command.lastIndexOf(" ", command.lastIndexOf(" ") - 1)).toFloat();
+            float maxTemp = command.substring(command.lastIndexOf(" ") + 1).toFloat();
+
+            configurePWMRange(minPWM, maxPWM, minTemp, maxTemp);
+        } else if (command == "ON ALL") {
+            if (!thermalSafetyTriggered) {
+                activateAllSegments();
+                Serial.println("All segments activated.");
+            } else {
+                Serial.println("Error: System in thermal safety state. Reset before continuing.");
+            }
+        } else if (command == "OFF ALL") {
+            deactivateAllSegments();
+            Serial.println("All segments deactivated.");
+        } else if (command.startsWith("ON")) {
+            int segmentNumber = command.substring(3).toInt();
+            if (segmentNumber >= 1 && segmentNumber <= 16) {
+                if (!thermalSafetyTriggered) {
+                    activateSegment(segmentNumber);
+                    Serial.print("Segment ");
+                    Serial.print(segmentNumber);
+                    Serial.println(" activated.");
+                } else {
+                    Serial.println("Error: System in thermal safety state. Reset before continuing.");
+                }
+            } else {
+                Serial.println("Error: Invalid segment number. Use HELP to see commands.");
+            }
+        } else if (command.startsWith("OFF")) {
+            int segmentNumber = command.substring(4).toInt();
+            if (segmentNumber >= 1 && segmentNumber <= 16) {
+                deactivateSegment(segmentNumber);
+                Serial.print("Segment ");
+                Serial.print(segmentNumber);
+                Serial.println(" deactivated.");
+            } else {
+                Serial.println("Error: Invalid segment number. Use HELP to see commands.");
+            }
+        } else if (command == "HELP") {
+            printHelp();
+        } else if (command == "RESET_SAFETY") {
+            resetThermalSafety();
+        } else {
+            Serial.println("Error: Unrecognized command. Use HELP to see commands.");
+        }
+    }
+}
+
+// ====== Function to update all sections ======
+void updateAllSections() {
+    for (int i = 0; i < 4; i++) {
+        updateTemperaturePWM(i, i * 4, (i * 4) + 3);
+        controlHeating(i, i * 4, (i * 4) + 3);
+    }
+}
+
+// ====== Function to print active segments periodically ======
+void printActiveSegmentsPeriodically() {
+    static unsigned long lastPrintTime = 0;
+    if (millis() - lastPrintTime >= 5000) {
+        lastPrintTime = millis();
+        printActiveSegments();
+    }
+}
+
+// ====== Function to read temperature from a sensor ======
+float readTemperature(int sensorPin) {
+    int sensorIndex = -1;
+
+    // Determine the sensor index based on the pin
+    for (int i = 0; i < 16; i++) {
+        if (tempSensors[i] == sensorPin) {
+            sensorIndex = i;
+            break;
+        }
+    }
+
+    // If the index is not found, return error
+    if (sensorIndex == -1) return -999.0;
+
+    // Check if the minimum interval has passed
+    if (millis() - lastReadTime[sensorIndex] < readInterval) {
+        return cachedTemperatures[sensorIndex]; // Return cached value
+    }
+
+    // Update the last read timestamp
+    lastReadTime[sensorIndex] = millis();
+
+    // Perform analog reading
+    int analogValue = analogRead(sensorPin);
+
+    // Protection against out-of-range readings
+    if (analogValue <= 0 || analogValue >= 1023) {
+        cachedTemperatures[sensorIndex] = -999.0; // Update cache with error
+        return -999.0;
+    }
+
+    // Find the closest value in the table
+    int i = 0;
+    while (pgm_read_word(&tempTable[i][0]) < analogValue && i < sizeof(tempTable) / sizeof(tempTable[0]) - 1) {
+        i++;
+    }
+
+    // Linear interpolation between two points in the table
+    float adcHigh = pgm_read_word(&tempTable[i][0]);
+    float tempHigh = pgm_read_word(&tempTable[i][1]);
+    float adcLow = pgm_read_word(&tempTable[i - 1][0]);
+    float tempLow = pgm_read_word(&tempTable[i - 1][1]);
+
+    float temperature = tempLow + (analogValue - adcLow) * (tempHigh - tempLow) / (adcHigh - adcLow);
+
+    // Update cache with new reading
+    cachedTemperatures[sensorIndex] = temperature;
+
+    return temperature;
+}
+
+// ====== Function to read target temperature from PWM signal ======
+float readTargetTemperature(int pwmPin) {
+    int pwmValue = pulseIn(pwmPin, HIGH, PWM_TIMEOUT); // Wait for timeout
+
+    // Validate PWM signal
+    if (pwmValue < pwmMinValue || pwmValue > pwmMaxValue) {
+        Serial.print("Error: PWM signal out of valid range (");
+        Serial.print(pwmValue);
+        Serial.println(").");
+        return -999.0; // Return error
+    }
+
+    // Map PWM value to target temperature
+    return map(pwmValue, pwmMinValue, pwmMaxValue, tempMin, tempMax);
+}
+
+// ====== Function to control heating based on target temperature ======
+void controlHeating(int secIndex, int start, int end) {
+    float sum = 0;
+    int count = 0;
+
+    for (int i = start; i <= end; i++) {
+        if (activeSegments[i]) {
+            sum += readTemperature(tempSensors[i]);
+            count++;
+        }
+    }
+
+    float avgTemp = (count > 0) ? (sum / count) : 0;
+    float target = targetTemp[secIndex];
+
+    // Simple ON/OFF control with hysteresis
+    bool heatingOn = (avgTemp < target - TEMP_HYSTERESIS);
+    bool heatingOff = (avgTemp > target + TEMP_HYSTERESIS);
+
+    for (int i = start; i <= end; i++) {
+        if (activeSegments[i]) {
+            if (heatingOn) {
+                digitalWrite(relayPins[i], LOW); // Turn on segment
+            } else if (heatingOff) {
+                digitalWrite(relayPins[i], HIGH); // Turn off segment
+            }
+        }
+    }
+
+    Serial.print("Sec ");
+    Serial.print(secIndex + 1);
+    Serial.print(" Current Temp: ");
+    Serial.print(avgTemp);
+    Serial.print("°C | Setpoint: ");
+    Serial.print(target);
+    Serial.println("°C");
+}
+
+// ====== Function to update temperature and PWM for a section ======
+void updateTemperaturePWM(int secIndex, int start, int end) {
+    float sum = 0;
+    int count = 0;
+
+    // Sum only active segments within the section
+    for (int i = start; i <= end; i++) {
+        if (activeSegments[i]) {
+            sum += readTemperature(tempSensors[i]);
+            count++;
+        }
+    }
+
+    // Calculate average only if there are active segments
+    float avgTemp = (count > 0) ? (sum / count) : 0;
+
+    // Convert temperature to PWM (Scale 0 to 100°C -> 0 to 255 PWM)
+    int pwmValue = constrain(map(avgTemp, 0, 100, 0, 255), 0, 255);
+    pwmValue = constrain(pwmValue, 0, 255); // Ensure within allowed range
+
+    // Send to DueX5 via PWM
+    analogWrite(pwmOutPins[secIndex], pwmValue);
+
+    Serial.print("Sec ");
+    Serial.print(secIndex + 1);
+    Serial.print(" Avg Temp: ");
+    Serial.print(avgTemp);
+    Serial.print("°C -> PWM: ");
+    Serial.println(pwmValue);
+}
+
+// ====== Function to activate a specific segment ======
+void activateSegment(int segment) {
+    if (segment < 1 || segment > 16) return;
+
+    int index = segment - 1;
+    digitalWrite(relayPins[index], LOW); // Activate relay (active LOW)
+    activeSegments[index] = true;
+
+    Serial.print("Segment activated: ");
+    Serial.println(segment);
+
+    printActiveSegments();
+}
+
+// ====== Function to deactivate a specific segment ======
+void deactivateSegment(int segment) {
+    if (segment < 1 || segment > 16) return;
+
+    int index = segment - 1;
+    digitalWrite(relayPins[index], HIGH); // Deactivate relay (active LOW)
+    activeSegments[index] = false;
+
+    Serial.print("Segment deactivated: ");
+    Serial.println(segment);
+
+    printActiveSegments();
+}
+
+// ====== Function to activate all segments ======
+void activateAllSegments() {
+    for (int i = 0; i < 16; i++) {
+        digitalWrite(relayPins[i], LOW); // Activate all relays (active LOW)
+        activeSegments[i] = true;
+    }
+
+    Serial.println("All segments activated.");
+    printActiveSegments();
+}
+
+// ====== Function to deactivate all segments ======
+void deactivateAllSegments() {
+    for (int i = 0; i < 16; i++) {
+        digitalWrite(relayPins[i], HIGH); // Turn off all relays (active LOW)
+        activeSegments[i] = false;
+    }
+
+    Serial.println("All segments deactivated.");
+    printActiveSegments();
+}
+
+// ====== Function to print all currently active segments ======
+void printActiveSegments() {
+    Serial.print("Active segments: ");
+    bool found = false;
+    for (int i = 0; i < 16; i++) {
+        if (activeSegments[i]) {
+            if (found) Serial.print(", ");
+            Serial.print(i + 1);
+            found = true;
+        }
+    }
+    if (!found) {
+        Serial.println("None");
+    } else {
+        Serial.println();
+    }
+}
+
+// ====== Thermal Safety Variables and Constants ======
+const float MAX_SAFE_TEMPERATURE = 120.0; // Maximum safe temperature (in °C)
+
+// ====== Function to check thermal safety ======
+void checkThermalSafety() {
+    for (int i = 0; i < 16; i++) {
+        float temp = readTemperature(tempSensors[i]);
+        if (temp > MAX_SAFE_TEMPERATURE) {
+            thermalSafetyTriggered = true;
+            deactivateAllSegments(); // Deactivate all segments
+            Serial.print("ALERT: Critical temperature detected in segment ");
+            Serial.print(i + 1);
+            Serial.print(" (");
+            Serial.print(temp);
+            Serial.println("°C). All segments deactivated!");
+            break;
+        }
+    }
+}
+
+// ====== Function to reset thermal safety state ======
+void resetThermalSafety() {
+    thermalSafetyTriggered = false;
+    Serial.println("Thermal safety state reset. System ready for use.");
+}
+
+// ====== Function to calculate PID control ======
+float calculatePID(int segmentIndex, float currentTemp, float targetTemp) {
+    unsigned long now = millis();
+    float deltaTime = (now - pidLastUpdate[segmentIndex]) / 1000.0; // Time in seconds
+    pidLastUpdate[segmentIndex] = now;
+
+    // Calculate error
+    float error = targetTemp - currentTemp;
+
+    // Calculate proportional term
+    float proportional = pidKp * error;
+
+    // Calculate integral term
+    pidIntegral[segmentIndex] += error * deltaTime;
+    float integral = pidKi * pidIntegral[segmentIndex];
+
+    // Calculate derivative term
+    float derivative = pidKd * (error - pidLastError[segmentIndex]) / deltaTime;
+    pidLastError[segmentIndex] = error;
+
+    // Sum terms to get PID output
+    float output = proportional + integral + derivative;
+
+    // Limit output between 0 and 1 (for relay control)
+    return constrain(output, 0.0, 1.0);
+}
+
+// ====== Function to control heating with PID ======
+void controlHeatingWithPID(int secIndex, int start, int end) {
+    for (int i = start; i <= end; i++) {
+        if (activeSegments[i]) {
+            float currentTemp = readTemperature(tempSensors[i]);
+            float target = targetTemp[secIndex];
+
+            // Calculate PID output
+            float pidOutput = calculatePID(i, currentTemp, target);
+
+            // Turn relay on or off based on PID output
+            if (pidOutput > PID_OUTPUT_THRESHOLD) {
+                digitalWrite(relayPins[i], LOW); // Turn on segment
+            } else {
+                digitalWrite(relayPins[i], HIGH); // Turn off segment
+            }
+
+            // Print information to Serial
+            Serial.print("Segment ");
+            Serial.print(i + 1);
+            Serial.print(" | Current Temp: ");
+            Serial.print(currentTemp);
+            Serial.print("°C | Setpoint: ");
+            Serial.print(target);
+            Serial.print("°C | PID Output: ");
+            Serial.println(pidOutput);
+        }
+    }
+}
+
+// ====== Function to monitor system in debug mode ======
+void debugMonitor() {
+    Serial.println("=== System Monitoring ===");
+    for (int i = 0; i < 16; i++) {
+        float temp = readTemperature(tempSensors[i]);
+        Serial.print("Segment ");
+        Serial.print(i + 1);
+        Serial.print(": ");
+        Serial.print(activeSegments[i] ? "Active" : "Inactive");
+        Serial.print(" | Temp: ");
+        Serial.print(temp);
+        Serial.println("°C");
+    }
+
+    for (int i = 0; i < 4; i++) {
+        Serial.print("Sec ");
+        Serial.print(i + 1);
+        Serial.print(" | Setpoint: ");
+        Serial.print(targetTemp[i]);
+        Serial.println("°C");
+    }
+
+    Serial.println("=========================");
+}
